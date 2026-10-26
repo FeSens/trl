@@ -55,7 +55,7 @@ from ..distributed import DistributedBackend
 from ..extras.profiling import profiling_context, profiling_decorator
 from ..generation.vllm_generation import VLLMGeneration
 from ..models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
-from ..models.utils import disable_gradient_checkpointing
+from ..models.utils import cast_parameters_for_generation, disable_gradient_checkpointing
 from .base_trainer import _BaseTrainer
 from .callbacks import SyncRefModelCallback
 from .rloo_config import RLOOConfig
@@ -1369,12 +1369,12 @@ class RLOOTrainer(_BaseTrainer):
                 ) as unwrapped_model,
                 torch.no_grad(),
                 self._dist.summon_full_params(self.model_wrapped, recurse=False),
+                # Generate in the training precision, without casting the trained parameters in place
+                cast_parameters_for_generation(
+                    unwrapped_model,
+                    torch.bfloat16 if self.args.bf16 else torch.float16 if self.args.fp16 else None,
+                ),
             ):
-                # Cast to the appropriate dtype based on training configuration
-                if self.args.bf16:
-                    unwrapped_model.to(torch.bfloat16)
-                elif self.args.fp16:
-                    unwrapped_model.to(torch.float16)
                 all_outputs = unwrapped_model.generate_batch(
                     prompt_ids,
                     generation_config=self.generation_config,

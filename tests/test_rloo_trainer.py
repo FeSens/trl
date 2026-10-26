@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -1644,6 +1645,49 @@ class TestRLOOTrainer(TrlTestCase):
         for n, param in previous_trainable_params.items():
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+    def test_transformers_continuous_batching_keeps_float32_parameters(self):
+        # With `bf16=True` on a float32 model, generation runs in bf16, but the trained parameters, and the optimizer
+        # states created from them, must stay float32 and must not be rounded by the generation.
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+        training_args = RLOOConfig(
+            output_dir=self.tmp_dir,
+            bf16=True,
+            per_device_train_batch_size=3,
+            num_generations=3,
+            max_completion_length=8,
+            max_steps=2,
+            report_to="none",
+            use_transformers_continuous_batching=True,
+            model_init_kwargs={"dtype": torch.float32},
+        )
+        trainer = RLOOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs="trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5",
+            args=training_args,
+            train_dataset=dataset,
+        )
+        model = trainer.accelerator.unwrap_model(trainer.model)
+        seen = []
+
+        # Continuous batching needs Flash Attention (see the test above). The dtype handling around the call is what
+        # is tested here, so stand in for the generation.
+        def generate_batch(prompt_ids, **kwargs):
+            seen.append({param.dtype for param in model.parameters()})
+            return {i: SimpleNamespace(generated_tokens=[1, 2, 3]) for i in range(len(prompt_ids))}
+
+        before = {n: param.clone() for n, param in model.named_parameters()}
+        with patch.object(model, "generate_batch", side_effect=generate_batch, create=True):
+            trainer._generate_single_turn([[1, 2], [3, 4, 5], [6]], None, {})
+            for n, param in model.named_parameters():
+                assert param.dtype == torch.float32, n
+                torch.testing.assert_close(param, before[n], rtol=0, atol=0)
+            trainer.train()
+
+        assert seen and all(dtypes == {torch.bfloat16} for dtypes in seen)
+        assert {param.dtype for param in model.parameters()} == {torch.float32}
+        for state in trainer.optimizer.state.values():
+            assert state["exp_avg"].dtype == torch.float32
 
     def test_train_with_normalized_advantages(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")

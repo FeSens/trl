@@ -148,6 +148,37 @@ def _unwrap_model_for_generation(
 
 
 @contextmanager
+def cast_parameters_for_generation(model: PreTrainedModel, dtype: torch.dtype | None):
+    """
+    Context manager to generate with the model's floating-point parameters in `dtype`, restoring the original
+    parameters on exit.
+
+    `model.to(dtype)` casts in place: with mixed precision (a float32 model and `bf16=True`), the trained parameters,
+    and the optimizer states created from them, would stay in `dtype` after the first generation, so training would go
+    on without float32 master weights. Instead, each parameter gets a copy in `dtype` for the duration of the
+    generation. Buffers are left as they are.
+
+    Args:
+        model ([`~transformers.PreTrainedModel`]):
+            The model (typically unwrapped_model) to generate with.
+        dtype (`torch.dtype` or `None`):
+            The dtype to generate in. If `None`, the model is left unchanged.
+    """
+    originals = []
+    if dtype is not None:
+        with torch.no_grad():
+            for param in model.parameters():
+                if param.is_floating_point() and param.dtype != dtype:
+                    originals.append((param, param.data))
+                    param.data = param.data.to(dtype)
+    try:
+        yield model
+    finally:
+        for param, data in originals:
+            param.data = data
+
+
+@contextmanager
 def _override_model_generation_config(model, generation_kwargs=None):
     """
     Context manager to temporarily override a model's generation_config with training config.
